@@ -12,6 +12,8 @@ import base64
 import json
 import platform
 import queue
+import shutil
+import ssl
 import subprocess
 import sys
 import threading
@@ -27,7 +29,13 @@ from urllib.request import Request, urlopen
 
 KMONI_BASE = "http://www.kmoni.bosai.go.jp"
 LATEST_URL = f"{KMONI_BASE}/webservice/server/pros/latest.json"
+EEW_URLS = (
+    "https://api.ydits.net/vxse43",
+    "https://api2.ydits.net/vxse43",
+    "https://api3.ydits.net/vxse43",
+)
 REFRESH_MS = 1000
+EEW_REFRESH_MS = 2000
 USER_AGENT = "EEW_Python-KyoshinAccelerationViewer/1.0"
 ALERT_COOLDOWN_SECONDS = 20
 ALERT_WARM_PIXEL_THRESHOLD = 8
@@ -41,10 +49,43 @@ class AccelerationFrame:
     image_url: str
 
 
+@dataclass
+class EewEvent:
+    event_id: str
+    report_time: str
+    origin_time: str
+    hypocenter: str
+    max_intensity: str
+    magnitude: str
+    depth_km: str
+    report_type: str = "normal"
+    is_final: bool = False
+    is_canceled: bool = False
+    is_warning: bool = False
+
+
 def fetch_bytes(url: str, timeout: int = 10) -> bytes:
     request = Request(url, headers={"User-Agent": USER_AGENT})
-    with urlopen(request, timeout=timeout) as response:
-        return response.read()
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            return response.read()
+    except URLError as exc:
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, ssl.SSLError):
+            return fetch_bytes_with_curl(url, timeout)
+        raise
+
+
+def fetch_bytes_with_curl(url: str, timeout: int = 10) -> bytes:
+    curl = shutil.which("curl")
+    if not curl:
+        raise RuntimeError("curl が見つからないため TLS フォールバックを実行できません")
+    completed = subprocess.run(
+        [curl, "-fsSL", "--max-time", str(timeout), "-A", USER_AGENT, url],
+        check=True,
+        capture_output=True,
+    )
+    return completed.stdout
 
 
 def fetch_json(url: str, timeout: int = 10) -> Any:
@@ -76,6 +117,72 @@ def load_acceleration_frame() -> AccelerationFrame:
     )
 
 
+def normalize_intensity(value: Any) -> str:
+    if value is None:
+        return "不明"
+    text = str(value).strip()
+    mapping = {
+        "5弱": "5-",
+        "5強": "5+",
+        "6弱": "6-",
+        "6強": "6+",
+        "unknown": "不明",
+    }
+    return mapping.get(text, text)
+
+
+def parse_eew(payload: dict[str, Any]) -> EewEvent | None:
+    if payload.get("status") != "OK" or not payload.get("isEew"):
+        return None
+
+    report = payload.get("report") or {}
+    earthquake = report.get("earthquake") or {}
+    report_time = report.get("time") or payload.get("time") or ""
+    origin_time = earthquake.get("originTime") or earthquake.get("arrivalTime") or report_time
+    hypocenter = earthquake.get("hypocenterName") or "不明"
+    max_intensity = normalize_intensity(earthquake.get("intensity"))
+    magnitude = earthquake.get("magnitude")
+    depth = earthquake.get("depth")
+    is_canceled = bool(report.get("isCanceled"))
+
+    event = EewEvent(
+        event_id=f"eew-{origin_time}-{report_time}-{hypocenter}-{is_canceled}",
+        report_time=report_time,
+        origin_time=origin_time,
+        hypocenter=hypocenter,
+        max_intensity="不明" if is_canceled else max_intensity,
+        magnitude="不明" if magnitude is None else str(magnitude),
+        depth_km="不明" if depth is None else f"{depth} km",
+        report_type=report.get("type", "normal"),
+        is_final=bool(report.get("isFinal")),
+        is_canceled=is_canceled,
+        is_warning=bool(report.get("isWarning")),
+    )
+    if earthquake.get("condition"):
+        event.magnitude = "仮定震源要素"
+        event.depth_km = "仮定震源要素"
+    return event
+
+
+def load_current_eew() -> EewEvent | None:
+    last_error: Exception | None = None
+    for url in EEW_URLS:
+        try:
+            return parse_eew(fetch_json(url, timeout=5))
+        except (
+            HTTPError,
+            URLError,
+            TimeoutError,
+            OSError,
+            subprocess.CalledProcessError,
+            json.JSONDecodeError,
+        ) as exc:
+            last_error = exc
+    if last_error:
+        raise last_error
+    return None
+
+
 def beep(repeats: int = 3) -> None:
     system = platform.system()
     for _ in range(repeats):
@@ -99,24 +206,28 @@ class AccelerationMonitor(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("NIED 強震モニタ 最大加速度")
-        self.geometry("430x560")
-        self.minsize(410, 540)
+        self.geometry("430x580")
+        self.minsize(410, 570)
 
         self.result_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.worker: threading.Thread | None = None
+        self.eew_worker: threading.Thread | None = None
         self.running = tk.BooleanVar(value=True)
         self.sound_enabled = tk.BooleanVar(value=True)
         self.status = tk.StringVar(value="起動中")
+        self.eew_status = tk.StringVar(value="発表なし")
         self.latest_time = tk.StringVar(value="-")
         self.request_time = tk.StringVar(value="-")
         self.image_url = tk.StringVar(value="-")
         self.photo: tk.PhotoImage | None = None
         self.refresh_after_id: str | None = None
+        self.eew_after_id: str | None = None
         self.first_frame = True
+        self.known_eew_id = ""
         self.last_alert_at = 0.0
 
         self._build_ui()
-        self.after(100, self.refresh)
+        self.after(100, self.refresh_all)
         self.after(200, self._drain_queue)
 
     def _build_ui(self) -> None:
@@ -129,7 +240,7 @@ class AccelerationMonitor(tk.Tk):
         ttk.Checkbutton(header, text="自動更新", variable=self.running, command=self._toggle_auto_refresh).pack(
             side="right", padx=(8, 0)
         )
-        ttk.Button(header, text="更新", command=self.refresh).pack(side="right", padx=(8, 0))
+        ttk.Button(header, text="更新", command=self.refresh_all).pack(side="right", padx=(8, 0))
         ttk.Button(header, text="音テスト", command=lambda: threading.Thread(target=beep, daemon=True).start()).pack(
             side="right", padx=(8, 0)
         )
@@ -150,9 +261,15 @@ class AccelerationMonitor(tk.Tk):
         ttk.Label(info, textvariable=self.request_time).grid(row=1, column=1, sticky="w")
         ttk.Label(info, text="状態").grid(row=2, column=0, sticky="w", padx=(0, 10))
         ttk.Label(info, textvariable=self.status).grid(row=2, column=1, sticky="w")
-        ttk.Label(info, text="ソース").grid(row=3, column=0, sticky="w", padx=(0, 10))
-        ttk.Label(info, textvariable=self.image_url, wraplength=320).grid(row=3, column=1, sticky="w")
+        ttk.Label(info, text="EEW").grid(row=3, column=0, sticky="w", padx=(0, 10))
+        ttk.Label(info, textvariable=self.eew_status, wraplength=320).grid(row=3, column=1, sticky="w")
+        ttk.Label(info, text="ソース").grid(row=4, column=0, sticky="w", padx=(0, 10))
+        ttk.Label(info, textvariable=self.image_url, wraplength=320).grid(row=4, column=1, sticky="w")
         info.columnconfigure(1, weight=1)
+
+    def refresh_all(self) -> None:
+        self.refresh()
+        self.refresh_eew()
 
     def refresh(self) -> None:
         if self.worker and self.worker.is_alive():
@@ -164,12 +281,27 @@ class AccelerationMonitor(tk.Tk):
         self.worker = threading.Thread(target=self._worker, daemon=True)
         self.worker.start()
 
+    def refresh_eew(self) -> None:
+        if self.eew_worker and self.eew_worker.is_alive():
+            return
+        if self.eew_after_id:
+            self.after_cancel(self.eew_after_id)
+            self.eew_after_id = None
+        self.eew_worker = threading.Thread(target=self._eew_worker, daemon=True)
+        self.eew_worker.start()
+
     def _worker(self) -> None:
         try:
             frame = load_acceleration_frame()
-            self.result_queue.put(("ok", frame))
+            self.result_queue.put(("accel_ok", frame))
         except (HTTPError, URLError, TimeoutError, OSError, KeyError, ValueError, json.JSONDecodeError) as exc:
-            self.result_queue.put(("error", exc))
+            self.result_queue.put(("accel_error", exc))
+
+    def _eew_worker(self) -> None:
+        try:
+            self.result_queue.put(("eew_ok", load_current_eew()))
+        except Exception as exc:
+            self.result_queue.put(("eew_error", exc))
 
     def _drain_queue(self) -> None:
         try:
@@ -177,8 +309,13 @@ class AccelerationMonitor(tk.Tk):
         except queue.Empty:
             pass
         else:
-            if kind == "ok":
+            if kind == "accel_ok":
                 self._show_frame(payload)
+            elif kind == "eew_ok":
+                self._show_eew(payload)
+            elif kind == "eew_error":
+                self.eew_status.set(f"EEW: 取得失敗 {payload}")
+                self._schedule_eew_refresh()
             else:
                 self.status.set(f"取得失敗: {payload}")
                 self._schedule_refresh()
@@ -200,18 +337,57 @@ class AccelerationMonitor(tk.Tk):
     def _toggle_auto_refresh(self) -> None:
         if self.running.get():
             self._schedule_refresh()
-        elif self.refresh_after_id:
+            self._schedule_eew_refresh()
+            return
+        if self.refresh_after_id:
             self.after_cancel(self.refresh_after_id)
             self.refresh_after_id = None
+        if self.eew_after_id:
+            self.after_cancel(self.eew_after_id)
+            self.eew_after_id = None
 
     def _schedule_refresh(self) -> None:
         if not self.running.get() or self.refresh_after_id:
             return
         self.refresh_after_id = self.after(REFRESH_MS, self._scheduled_refresh)
 
+    def _schedule_eew_refresh(self) -> None:
+        if not self.running.get() or self.eew_after_id:
+            return
+        self.eew_after_id = self.after(EEW_REFRESH_MS, self._scheduled_eew_refresh)
+
     def _scheduled_refresh(self) -> None:
         self.refresh_after_id = None
         self.refresh()
+
+    def _scheduled_eew_refresh(self) -> None:
+        self.eew_after_id = None
+        self.refresh_eew()
+
+    def _show_eew(self, event: EewEvent | None) -> None:
+        if event is None:
+            self.eew_status.set("発表なし")
+            self.known_eew_id = ""
+            self._schedule_eew_refresh()
+            return
+
+        label = "取消" if event.is_canceled else f"{event.hypocenter} 最大震度 {event.max_intensity}"
+        suffix = []
+        if event.is_warning:
+            suffix.append("警報")
+        if event.is_final:
+            suffix.append("最終報")
+        if event.report_type != "normal":
+            suffix.append(event.report_type)
+        detail = f" ({', '.join(suffix)})" if suffix else ""
+        self.eew_status.set(f"{label}{detail}")
+
+        is_new = event.event_id != self.known_eew_id
+        self.known_eew_id = event.event_id
+        if is_new and event.report_type == "normal" and self.sound_enabled.get():
+            threading.Thread(target=beep, daemon=True).start()
+            self.bell()
+        self._schedule_eew_refresh()
 
     def _count_warm_pixels(self) -> int:
         if not self.photo:
