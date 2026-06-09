@@ -206,14 +206,15 @@ class AccelerationMonitor(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("NIED 強震モニタ 最大加速度")
-        self.geometry("430x580")
-        self.minsize(410, 570)
+        self.geometry("430x610")
+        self.minsize(410, 600)
 
         self.result_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.worker: threading.Thread | None = None
         self.eew_worker: threading.Thread | None = None
         self.running = tk.BooleanVar(value=True)
-        self.sound_enabled = tk.BooleanVar(value=True)
+        self.shaking_sound_enabled = tk.BooleanVar(value=True)
+        self.eew_sound_enabled = tk.BooleanVar(value=True)
         self.status = tk.StringVar(value="起動中")
         self.eew_status = tk.StringVar(value="発表なし")
         self.latest_time = tk.StringVar(value="-")
@@ -236,14 +237,17 @@ class AccelerationMonitor(tk.Tk):
         header = ttk.Frame(self, padding=(14, 10))
         header.pack(fill="x")
         ttk.Label(header, text="最大加速度", font=("", 16, "bold")).pack(side="left")
-        ttk.Checkbutton(header, text="警告音", variable=self.sound_enabled).pack(side="right", padx=(8, 0))
         ttk.Checkbutton(header, text="自動更新", variable=self.running, command=self._toggle_auto_refresh).pack(
             side="right", padx=(8, 0)
         )
         ttk.Button(header, text="更新", command=self.refresh_all).pack(side="right", padx=(8, 0))
-        ttk.Button(header, text="音テスト", command=lambda: threading.Thread(target=beep, daemon=True).start()).pack(
-            side="right", padx=(8, 0)
-        )
+
+        sound_bar = ttk.Frame(self, padding=(14, 0, 14, 10))
+        sound_bar.pack(fill="x")
+        ttk.Checkbutton(sound_bar, text="揺れ検知音", variable=self.shaking_sound_enabled).pack(side="left")
+        ttk.Button(sound_bar, text="揺れ音テスト", command=self._test_shaking_sound).pack(side="left", padx=(8, 0))
+        ttk.Checkbutton(sound_bar, text="EEW音", variable=self.eew_sound_enabled).pack(side="left", padx=(18, 0))
+        ttk.Button(sound_bar, text="EEW音テスト", command=self._test_eew_sound).pack(side="left", padx=(8, 0))
 
         body = ttk.Frame(self, padding=(14, 0, 14, 10))
         body.pack(fill="both", expand=True)
@@ -384,7 +388,7 @@ class AccelerationMonitor(tk.Tk):
 
         is_new = event.event_id != self.known_eew_id
         self.known_eew_id = event.event_id
-        if is_new and event.report_type == "normal" and self.sound_enabled.get():
+        if is_new and event.report_type == "normal" and self.eew_sound_enabled.get():
             threading.Thread(target=beep, daemon=True).start()
             self.bell()
         self._schedule_eew_refresh()
@@ -424,7 +428,7 @@ class AccelerationMonitor(tk.Tk):
         if self.first_frame:
             self.first_frame = False
             return
-        if not shaking or not self.sound_enabled.get():
+        if not shaking or not self.shaking_sound_enabled.get():
             return
         now = time.monotonic()
         if now - self.last_alert_at < ALERT_COOLDOWN_SECONDS:
@@ -432,6 +436,12 @@ class AccelerationMonitor(tk.Tk):
         self.last_alert_at = now
         threading.Thread(target=beep, daemon=True).start()
         self.bell()
+
+    def _test_shaking_sound(self) -> None:
+        threading.Thread(target=beep, daemon=True).start()
+
+    def _test_eew_sound(self) -> None:
+        threading.Thread(target=beep, daemon=True).start()
 
     def _redraw_image(self) -> None:
         self.canvas.delete("all")
