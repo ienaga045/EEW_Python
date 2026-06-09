@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import base64
 import json
+import platform
 import queue
+import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
@@ -26,6 +29,8 @@ KMONI_BASE = "http://www.kmoni.bosai.go.jp"
 LATEST_URL = f"{KMONI_BASE}/webservice/server/pros/latest.json"
 REFRESH_MS = 1000
 USER_AGENT = "EEW_Python-KyoshinAccelerationViewer/1.0"
+ALERT_COOLDOWN_SECONDS = 20
+ALERT_WARM_PIXEL_THRESHOLD = 8
 
 
 @dataclass
@@ -71,42 +76,68 @@ def load_acceleration_frame() -> AccelerationFrame:
     )
 
 
+def beep(repeats: int = 3) -> None:
+    system = platform.system()
+    for _ in range(repeats):
+        try:
+            if system == "Darwin":
+                subprocess.Popen(["afplay", "/System/Library/Sounds/Sosumi.aiff"])
+            elif system == "Windows":
+                import winsound
+
+                winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+            else:
+                sys.stdout.write("\a")
+                sys.stdout.flush()
+        except Exception:
+            sys.stdout.write("\a")
+            sys.stdout.flush()
+        time.sleep(0.35)
+
+
 class AccelerationMonitor(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("NIED 強震モニタ 最大加速度")
-        self.geometry("760x620")
-        self.minsize(560, 520)
+        self.geometry("430x560")
+        self.minsize(410, 540)
 
         self.result_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.worker: threading.Thread | None = None
         self.running = tk.BooleanVar(value=True)
+        self.sound_enabled = tk.BooleanVar(value=True)
         self.status = tk.StringVar(value="起動中")
         self.latest_time = tk.StringVar(value="-")
         self.request_time = tk.StringVar(value="-")
         self.image_url = tk.StringVar(value="-")
         self.photo: tk.PhotoImage | None = None
         self.refresh_after_id: str | None = None
+        self.first_frame = True
+        self.last_alert_at = 0.0
 
         self._build_ui()
         self.after(100, self.refresh)
         self.after(200, self._drain_queue)
 
     def _build_ui(self) -> None:
-        self.configure(bg="#101418")
+        self.configure(bg="#666666")
 
         header = ttk.Frame(self, padding=(14, 10))
         header.pack(fill="x")
-        ttk.Label(header, text="NIED 強震モニタ 最大加速度", font=("", 18, "bold")).pack(side="left")
+        ttk.Label(header, text="最大加速度", font=("", 16, "bold")).pack(side="left")
+        ttk.Checkbutton(header, text="警告音", variable=self.sound_enabled).pack(side="right", padx=(8, 0))
         ttk.Checkbutton(header, text="自動更新", variable=self.running, command=self._toggle_auto_refresh).pack(
             side="right", padx=(8, 0)
         )
         ttk.Button(header, text="更新", command=self.refresh).pack(side="right", padx=(8, 0))
+        ttk.Button(header, text="音テスト", command=lambda: threading.Thread(target=beep, daemon=True).start()).pack(
+            side="right", padx=(8, 0)
+        )
 
         body = ttk.Frame(self, padding=(14, 0, 14, 10))
         body.pack(fill="both", expand=True)
 
-        self.canvas = tk.Canvas(body, bg="#000000", highlightthickness=0)
+        self.canvas = tk.Canvas(body, bg="#666666", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<Configure>", lambda _event: self._redraw_image())
 
@@ -120,7 +151,7 @@ class AccelerationMonitor(tk.Tk):
         ttk.Label(info, text="状態").grid(row=2, column=0, sticky="w", padx=(0, 10))
         ttk.Label(info, textvariable=self.status).grid(row=2, column=1, sticky="w")
         ttk.Label(info, text="ソース").grid(row=3, column=0, sticky="w", padx=(0, 10))
-        ttk.Label(info, textvariable=self.image_url, wraplength=620).grid(row=3, column=1, sticky="w")
+        ttk.Label(info, textvariable=self.image_url, wraplength=320).grid(row=3, column=1, sticky="w")
         info.columnconfigure(1, weight=1)
 
     def refresh(self) -> None:
@@ -159,8 +190,11 @@ class AccelerationMonitor(tk.Tk):
         self.latest_time.set(frame.latest_time)
         self.request_time.set(frame.request_time or datetime.now().strftime("%Y/%m/%d %H:%M:%S"))
         self.image_url.set(frame.image_url)
-        self.status.set("表示中")
+        warm_pixels = self._count_warm_pixels()
+        shaking = warm_pixels >= ALERT_WARM_PIXEL_THRESHOLD
+        self.status.set("揺れ検知" if shaking else "表示中")
         self._redraw_image()
+        self._maybe_alert(shaking)
         self._schedule_refresh()
 
     def _toggle_auto_refresh(self) -> None:
@@ -179,6 +213,50 @@ class AccelerationMonitor(tk.Tk):
         self.refresh_after_id = None
         self.refresh()
 
+    def _count_warm_pixels(self) -> int:
+        if not self.photo:
+            return 0
+        count = 0
+        width = self.photo.width()
+        height = self.photo.height()
+        for y in range(height):
+            for x in range(width):
+                color = self.photo.get(x, y)
+                if isinstance(color, tuple):
+                    red, green, blue = color[:3]
+                else:
+                    red, green, blue = self.winfo_rgb(color)
+                    red //= 256
+                    green //= 256
+                    blue //= 256
+                if self._is_shaking_color(red, green, blue):
+                    count += 1
+                    if count >= ALERT_WARM_PIXEL_THRESHOLD:
+                        return count
+        return count
+
+    def _is_shaking_color(self, red: int, green: int, blue: int) -> bool:
+        if red >= 210 and green >= 210 and blue >= 210:
+            return True
+        if red >= 190 and green >= 70 and blue <= 180:
+            return True
+        if red >= 180 and green <= 90 and blue <= 120:
+            return True
+        return False
+
+    def _maybe_alert(self, shaking: bool) -> None:
+        if self.first_frame:
+            self.first_frame = False
+            return
+        if not shaking or not self.sound_enabled.get():
+            return
+        now = time.monotonic()
+        if now - self.last_alert_at < ALERT_COOLDOWN_SECONDS:
+            return
+        self.last_alert_at = now
+        threading.Thread(target=beep, daemon=True).start()
+        self.bell()
+
     def _redraw_image(self) -> None:
         self.canvas.delete("all")
         if not self.photo:
@@ -196,14 +274,6 @@ class AccelerationMonitor(tk.Tk):
         x = width / 2
         y = height / 2
         self.canvas.create_image(x, y, image=self.photo, anchor="center")
-        self.canvas.create_text(
-            14,
-            14,
-            anchor="nw",
-            text="最大加速度",
-            fill="#e8edf2",
-            font=("", 14, "bold"),
-        )
 
 
 def main() -> None:
